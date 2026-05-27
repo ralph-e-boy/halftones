@@ -527,20 +527,28 @@ def erwin_grain_screen(intensity: np.ndarray,
                        paper_rgb: np.ndarray,
                        seed: int = 0) -> np.ndarray:
     """Erwin reticulated-gelatin grain screen — long, sinuous filaments. We
-    approximate the reticulation by warping a coarse grid through two octaves
-    of smooth noise."""
+    approximate the reticulation by warping a sin/cos grid through two
+    smooth-noise fields. The noise is generated at coarse resolution
+    (≈ grain_px subsample) and bilinearly upscaled — the visible feature
+    size is set by `grain_px * 1.2`, so finer detail than that would be
+    blurred away anyway."""
     rng = np.random.default_rng(seed)
     h, w = intensity.shape
-    y, x = np.mgrid[0:h, 0:w].astype(np.float32)
-    n1 = gaussian_filter(rng.standard_normal((h, w)).astype(np.float32),
-                         sigma=grain_px * 1.2)
-    n2 = gaussian_filter(rng.standard_normal((h, w)).astype(np.float32),
-                         sigma=grain_px * 1.2)
+    k = max(2.0, float(grain_px))
+    ch, cw = max(4, int(round(h / k))), max(4, int(round(w / k)))
+    n1c = gaussian_filter(rng.standard_normal((ch, cw)).astype(np.float32),
+                          sigma=1.2)
+    n2c = gaussian_filter(rng.standard_normal((ch, cw)).astype(np.float32),
+                          sigma=1.2)
+    n1 = zoom(n1c, (h / ch, w / cw), order=1)[:h, :w]
+    n2 = zoom(n2c, (h / ch, w / cw), order=1)[:h, :w]
+    xs = np.arange(w, dtype=np.float32)[None, :]
+    ys = np.arange(h, dtype=np.float32)[:, None]
     warp = reticulation * grain_px * 3.0
-    sx = (x + warp * (n1 - n1.mean()) / (n1.std() + 1e-9))
-    sy = (y + warp * (n2 - n2.mean()) / (n2.std() + 1e-9))
-    base = np.sin(2.0 * math.pi * sx / max(1.0, grain_px * 1.4)) * \
-           np.cos(2.0 * math.pi * sy / max(1.0, grain_px * 1.4))
+    sx = xs + warp * (n1 - n1.mean()) / (n1.std() + 1e-9)
+    sy = ys + warp * (n2 - n2.mean()) / (n2.std() + 1e-9)
+    freq = 2.0 * math.pi / max(1.0, grain_px * 1.4)
+    base = np.sin(freq * sx) * np.cos(freq * sy)
     base = (base - base.min()) / (base.max() - base.min() + 1e-9)
     coverage = (base > intensity).astype(np.float32)
     return ink_over_paper(coverage, ink_rgb, paper_rgb)
@@ -836,7 +844,8 @@ def apply_paper(image_rgb: np.ndarray, texture: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 # Modes that translate cleanly to a per-pixel GPU shader. Error diffusion is
-# inherently sequential; Metzograph/Erwin need precomputed noise textures.
+# inherently sequential; Metzograph still needs a precomputed crack texture.
+# Erwin uses value-noise warp (smoothed grid-hash), so it ports cleanly.
 SHADER_MODES = {
     "Ives/Levy (AM dot)",
     "CMYK process color",
@@ -844,6 +853,7 @@ SHADER_MODES = {
     "Wavy-line screen",
     "Stochastic / FM (Autotype)",
     "Bayer ordered dither",
+    "Erwin grain (reticulated)",
 }
 
 
@@ -1125,6 +1135,49 @@ void main() {{
 }}
 """
 
+    if mode == "Erwin grain (reticulated)":
+        seed = float(p.get("seed", 2))
+        return f"""{GLSL_HEADER}
+// Hash + smoothstep value noise — the GPU equivalent of the CPU path's
+// gaussian-filtered random field. Cell size scales with grain_px so the
+// noise's feature size matches the sin/cos pattern's period.
+float hash21(vec2 p) {{
+    p = fract(p * vec2(443.8975, 397.2973));
+    p += dot(p, p + 19.19);
+    return fract(p.x * p.y);
+}}
+float vnoise(vec2 p) {{
+    vec2 i = floor(p), f = fract(p);
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + vec2(1.0, 0.0));
+    float c = hash21(i + vec2(0.0, 1.0));
+    float d = hash21(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}}
+void main() {{
+    {_glsl_aspect_correction()}
+    float grain = {p['grain']:.4f};
+    float retic = {p['retic']:.4f};
+    float seed = {seed:.1f};
+    vec2 nc = frag / max(grain, 1.0);
+    // Two decorrelated noise samples; subtract 0.5 → zero-mean, scale by
+    // sqrt(12) so std≈1 (matches the CPU normalisation).
+    float n1 = (vnoise(nc + vec2(seed * 1.3, seed * 2.7)) - 0.5) * 3.4641;
+    float n2 = (vnoise(nc + vec2(seed * 5.1 + 31.7, seed * 4.3 + 11.3)) - 0.5) * 3.4641;
+    float warp = retic * grain * 3.0;
+    float sx = frag.x + warp * n1;
+    float sy = frag.y + warp * n2;
+    float period = max(1.0, grain * 1.4);
+    float base = sin(6.2831853 * sx / period) * cos(6.2831853 * sy / period);
+    float pat = 0.5 + 0.5 * base;
+    vec4 src = texture2D(u_texture, uv_tex);
+    float lum = {_glsl_lum()};
+    float coverage = step(lum, pat);
+    gl_FragColor = vec4(mix(u_paper, u_ink, coverage), 1.0);
+}}
+"""
+
     return f"// Shader generation not supported for: {mode}\n"
 
 
@@ -1289,6 +1342,52 @@ fragment float4 halftone_fm(
     float4 src = tex.sample(samp, in.uv);
     float lum = dot(src.rgb, float3(0.2126, 0.7152, 0.0722));
     float coverage = step(lum, noise);
+    return float4(mix(paperColor, inkColor, coverage), 1.0);
+}}
+"""
+
+    if mode == "Erwin grain (reticulated)":
+        seed = float(p.get("seed", 2))
+        return f"""{METAL_HEADER}
+inline float hash21(float2 p) {{
+    p = fract(p * float2(443.8975, 397.2973));
+    p += dot(p, p + 19.19);
+    return fract(p.x * p.y);
+}}
+inline float vnoise(float2 p) {{
+    float2 i = floor(p), f = fract(p);
+    float2 u = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + float2(1.0, 0.0));
+    float c = hash21(i + float2(0.0, 1.0));
+    float d = hash21(i + float2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}}
+
+fragment float4 halftone_erwin(
+    VOut in [[stage_in]],
+    texture2d<float> tex [[texture(0)]],
+    sampler samp [[sampler(0)]],
+    constant float2& resolution [[buffer(0)]],
+    constant float3& inkColor [[buffer(1)]],
+    constant float3& paperColor [[buffer(2)]])
+{{
+    float2 frag = in.uv * resolution;
+    float grain = {p['grain']:.4f};
+    float retic = {p['retic']:.4f};
+    float seed = {seed:.1f};
+    float2 nc = frag / max(grain, 1.0);
+    float n1 = (vnoise(nc + float2(seed * 1.3, seed * 2.7)) - 0.5) * 3.4641;
+    float n2 = (vnoise(nc + float2(seed * 5.1 + 31.7, seed * 4.3 + 11.3)) - 0.5) * 3.4641;
+    float warp = retic * grain * 3.0;
+    float sx = frag.x + warp * n1;
+    float sy = frag.y + warp * n2;
+    float period = max(1.0, grain * 1.4);
+    float base = sin(6.2831853 * sx / period) * cos(6.2831853 * sy / period);
+    float pat = 0.5 + 0.5 * base;
+    float4 src = tex.sample(samp, in.uv);
+    float lum = dot(src.rgb, float3(0.2126, 0.7152, 0.0722));
+    float coverage = step(lum, pat);
     return float4(mix(paperColor, inkColor, coverage), 1.0);
 }}
 """
@@ -1584,12 +1683,11 @@ with st.sidebar:
         pre_vignette = st.slider("vignette", 0.0, 1.0, 0.0, step=0.01)
         pre_threshold = st.slider("threshold (binarise)",
                                   0.0, 1.0, 0.0, step=0.005)
-        lvl_black = st.slider("levels: black point",
-                              0.0, 0.49, 0.0, step=0.005)
-        lvl_mid = st.slider("levels: mid (gamma pivot)",
+        lvl_black, lvl_white = st.slider(
+            "levels: black / white",
+            0.0, 1.0, (0.0, 1.0), step=0.005)
+        lvl_mid = st.slider("levels: mid (γ pivot)",
                             0.05, 0.95, 0.5, step=0.005)
-        lvl_white = st.slider("levels: white point",
-                              0.51, 1.0, 1.0, step=0.005)
         pre_invert_src = st.checkbox("invert source")
 
     with st.expander("◳ paper", expanded=False):
@@ -1920,9 +2018,9 @@ with tab_shader:
     if mode not in SHADER_MODES:
         st.warning(
             f"**{mode}** doesn't map to a stateless per-pixel shader "
-            "(error diffusion is sequential; grain screens need a noise "
-            "texture). Pick AM, CMYK, Line, Wavy, FM, or Bayer in the "
-            "sidebar to generate a shader."
+            "(error diffusion is sequential; Metzograph needs a crack "
+            "texture). Pick AM, CMYK, Line, Wavy, FM, Bayer, or Erwin in "
+            "the sidebar to generate a shader."
         )
     else:
         glsl_src = generate_glsl(mode, params, ink, paper)
